@@ -13,7 +13,7 @@ pep8:
 	pep8 . --ignore=E402,E501,E731
 
 pylint:
-	pylint tail; find bin -name '*.py' -exec pylint {} +
+	pylint tail
 
 pylintE:
-	pylint -E tail; find bin -name '*.py' -exec pylint -E {} +
+	pylint -E tail

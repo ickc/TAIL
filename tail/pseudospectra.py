@@ -151,13 +151,13 @@ def _form_1d_cross_spectra_nodiag(pixel_size, lmax, mapX, weightX, mapY, weightY
 
 @jit(nopython=True, nogil=True, parallel=True)
 def _form_1d_cross_spectra_cross(
-        pixel_size, lmax,
-        map0A, weight0A,
-        map0B, weight0B,
-        map1A, weight1A,
-        map1B, weight1B,
-        n_auto=-1
-    ):
+    pixel_size, lmax,
+    map0A, weight0A,
+    map0B, weight0B,
+    map1A, weight1A,
+    map1B, weight1B,
+    n_auto=-1
+):
     '''
     return auto, cross
 

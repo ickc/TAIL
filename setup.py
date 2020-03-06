@@ -111,9 +111,25 @@ setup(
     # To provide executable scripts, use entry points in preference to the
     # "scripts" keyword. Entry points provide cross-platform support and allow
     # pip to create the appropriate form of executable for the target platform.
-    # entry_points={
-        # 'console_scripts': [
-            # 'tail = tail.tail:cli'
-        # ],
-    # },
+    entry_points={
+        'console_scripts': [
+            'iterative_map = tail.pipeline.iterative_map:cli',
+            # see pairs below
+            'collect_weight_db = tail.pipeline.collect_weight_db:cli',
+            'mask = tail.pipeline.mask:cli',
+            'mode_coupling_matrix = tail.pipeline.mode_coupling_matrix:cli',
+            'null_spectra = tail.pipeline.null_spectra:cli',
+            'pseudo_spectra_selection = tail.pipeline.pseudo_spectra_selection:cli',
+            'pseudospectra_iter = tail.pipeline.pseudospectra_iter:cli',
+            'pseudospectra_mpi = tail.pipeline.pseudospectra_mpi:cli',
+            # .py are here for backward compatibility
+            'collect_weight_db.py = tail.pipeline.collect_weight_db:cli',
+            'mask.py = tail.pipeline.mask:cli',
+            'mode_coupling_matrix.py = tail.pipeline.mode_coupling_matrix:cli',
+            'null_spectra.py = tail.pipeline.null_spectra:cli',
+            'pseudo_spectra_selection.py = tail.pipeline.pseudo_spectra_selection:cli',
+            'pseudospectra_iter.py = tail.pipeline.pseudospectra_iter:cli',
+            'pseudospectra_mpi.py = tail.pipeline.pseudospectra_mpi:cli',
+        ],
+    },
 )
