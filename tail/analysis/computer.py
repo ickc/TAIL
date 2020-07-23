@@ -1,7 +1,7 @@
 
 from .container import Spectra, FilterTransfer
 from .loader import AllInput
-from .helper import matrix_reduce, matrix_reduce_row, matrix_reduce_col, uncertainties_to_real, uncertainties_to_rel
+from .helper import matrix_reduce, matrix_reduce_row, matrix_reduce_col
 
 import sys
 from functools import partial
@@ -150,9 +150,8 @@ class ComputeSpectra(object):
     '''prepare arrays for computing spectra from its inputs
 
     pseudo_spectra: 6d-arrays: ('spectra', 'null_split', 'sub_split', 'l', 'sub_spectra', 'n')
-    filter_transfer: 4d-arrays: ('spectra', 'null_split', 'sub_split', 'l') # same as rel_err
-    K_ll: ('spectra', 'l', 'l') # same as Ms
-    or if right: ('spectra', 'null_split', 'sub_split', 'l', 'l')
+    filter_transfer: 4d-arrays: ('spectra', 'null_split', 'sub_split', 'l')
+    K_ll: ('spectra', 'null_split', 'sub_split', 'l', 'l')
 
     Compute K_ll for next step
     '''
@@ -168,7 +167,7 @@ class ComputeSpectra(object):
         null_split=['full'],
         full=True,
         right=False,
-        rel_err=None,
+        filter_divided_from_spectra=False,
         **kwargs
     ):
         self.K_ll = K_ll
@@ -179,19 +178,31 @@ class ComputeSpectra(object):
         self.null_split = null_split
         self.full = full
         self.right = right
-        self.rel_err = rel_err
+        self.filter_divided_from_spectra = filter_divided_from_spectra
 
         self.map_cases = tuple(kwargs.keys())
         for key, value in kwargs.items():
             setattr(self, key, value)
 
     @classmethod
-    def load(cls, spectra_input: AllInput, uncertainties=False):
+    def load(cls, spectra_input: AllInput, filter_divided_from_spectra=False, compute_pwf=False, angle=(np.pi / 5400.)):
+        '''similar to `.filter_transfer.ComputeFilterTransfer.load`
+
+        :param bool filter_divided_from_spectra: if True, divide the filter transfer
+        function from pseudo-spectra. Else, multiply it into K_ll. Invalid if
+        `filter_transfer.right is True`
+
+        :param bool compute_pwf: compute PWF and put it in the K matrix. This should not be done
+        if PWF is applied in the pseudo-spectra stage already. c.f. `container.GenericSpectra.scaling`
+
+        :param float angle: only used if compute_pwf. Default: 2 arcmin in radian
         '''
-        similar to `.filter_transfer.ComputeFilterTransfer.load`
-        '''
-        # meta
         filter_transfer = spectra_input.filter_transfer
+        # check
+        right = filter_transfer.right
+        if right and filter_divided_from_spectra:
+            raise ValueError('filter_divided_from_spectra cannot be True when right is True.')
+        # meta
         l_min = filter_transfer.l_min
         l_max = filter_transfer.l_max
         norm = filter_transfer.norm
@@ -200,32 +211,36 @@ class ComputeSpectra(object):
         spectra = pseudo_spectra.spectra
         pseudo_spectra_dict_l_sliced = pseudo_spectra.pseudo_spectra_dict_l_sliced(l_min, l_max)
 
-        Fs = filter_transfer.solve(spectra, uncertainties=uncertainties)
-        B_2 = spectra_input.beam_spectra.squared_interp(l_min, l_max, uncertainties=uncertainties)
+        Fs = filter_transfer.solve(spectra)
+        B_2 = spectra_input.beam_spectra.squared_interp(l_min, l_max)
 
-        # since it is computationally infeasible to propagate the error through the MASTER equations,
-        # only keep track of relative errors approximately
-        if uncertainties:
-            rel_err = uncertainties_to_rel(Fs * B_2)
-            Fs = uncertainties_to_real(Fs)
-            B_2 = uncertainties_to_real(B_2)
-        else:
-            rel_err = None
+        if compute_pwf:
+            from .pwf import p_l_integrate
+
+            # compute PWF
+            # ignore the error term returned from p_l_integrate
+            pwf_2 = np.square(np.ascontiguousarray(
+                p_l_integrate(np.arange(l_min, l_max), angle)[:, 0]
+            ))
+
+            # scaling by PWF
+            print(f'Applying PWF in K matrix...', file=sys.stderr)
+            B_2 *= pwf_2
 
         # mode-coupling
         Ms = spectra_input.mode_coupling.transform_for_filter_transfer(l_min, l_max, spectra, norm=norm)
 
-        right = filter_transfer.right
         if right:
             K_ll = Ms[:, None, None, :, :] * (Fs[:, :, :, None, :] * B_2[None, None, None, None, :])
-        else:
-            Fs_reshaped = Fs[:, :, :, :, None, None]
+        elif filter_divided_from_spectra:
             # filter transfer corrected pseudo-spectra
             pseudo_spectra_dict_l_sliced = {
-                spectrum: value / Fs_reshaped
+                spectrum: value / Fs[:, :, :, :, None, None]
                 for spectrum, value in pseudo_spectra_dict_l_sliced.items()
             }
-            K_ll = Ms * B_2
+            K_ll = (Ms * B_2)[:, None, None, :, :]
+        else:
+            K_ll = Fs[:, :, :, :, None] * (Ms[:, None, None, :, :] * B_2[None, None, None, None, :])
 
         return cls(
             K_ll,
@@ -237,7 +252,7 @@ class ComputeSpectra(object):
             null_split=pseudo_spectra.null_split,
             full=spectra_input.full,
             right=right,
-            rel_err=rel_err,
+            filter_divided_from_spectra=filter_divided_from_spectra,
             **pseudo_spectra_dict_l_sliced
         )
 
@@ -262,15 +277,9 @@ class ComputeSpectra(object):
 
         l_rel_min = l_min - self.l_min
         l_rel_max = l_max - self.l_min
-        K_ll = (
-            self.K_ll[:, :, :, l_rel_min:l_rel_max][:, :, :, :, l_rel_min:l_rel_max]
-        ) if self.right else (
-            self.K_ll[:, l_rel_min:l_rel_max][:, :, l_rel_min:l_rel_max]
-        )
+        K_ll = self.K_ll[:, :, :, l_rel_min:l_rel_max][:, :, :, :, l_rel_min:l_rel_max]
 
         K_bb = matrix_reduce(K_ll, bin_width)
-        if not self.right:
-            K_bb_reshaped = K_bb[:, None, None, :, :]
 
         res = dict()
         # can speed up if packing map_cases in one array and do solve in 1 pass
@@ -284,7 +293,7 @@ class ComputeSpectra(object):
             Cl = Cl.reshape(n_spectra, n_null_split, n_sub_split, n_l, n_sub_spectra * n)
 
             Cb = matrix_reduce_row(Cl, bin_width)
-            Cb_est = linalg.solve(K_bb, Cb) if self.right else linalg.solve(K_bb_reshaped, Cb)
+            Cb_est = linalg.solve(K_bb, Cb)
 
             # reshape back
             Cb_est = Cb_est.reshape(list(Cb_est.shape[:-1]) + [n_sub_spectra, n])
@@ -297,14 +306,11 @@ class ComputeSpectra(object):
         else:
             w_bl = None
 
-        # ('spectra', 'null_split', 'sub_split', 'l')
-        rel_err = None if self.rel_err is None else matrix_reduce_col(self.rel_err[:, :, :, l_rel_min:l_rel_max], bin_width)
-
         return Spectra(
             self.spectra, self.null_split, self.sub_spectra,
             l_min, l_max, bin_width,
             w_bl=w_bl,
-            rel_err=rel_err,
             right=self.right,
+            filter_divided_from_spectra=self.filter_divided_from_spectra,
             **res
         )

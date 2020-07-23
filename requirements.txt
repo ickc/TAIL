@@ -1,0 +1,17 @@
+astropy
+defopt
+emcee
+h5py
+matplotlib
+mpi4py
+numba
+numpy
+pandas
+plotly
+quaternion
+scipy
+seaborn
+uncertainties
+pyyaml
+
+dautilpy

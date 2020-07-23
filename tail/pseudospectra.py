@@ -51,7 +51,7 @@ def compute_nu(pixel_size, lmax, mask):
 @jit(nopython=True, nogil=True, parallel=True)
 def _bin_psd(pixel_size, l_max, psd):
     '''similar to ``_bin_psd2`` but psd is already
-    sqaured and ``l`` is already calculated
+    sqaured
     '''
     N = psd.shape[0]
     freq = fftfreq(N, pixel_size)
@@ -85,6 +85,31 @@ def _bin_psd(pixel_size, l_max, psd):
     # we have no information there
     fill_nan(psd_1d, fill_boundary=False)
     return psd_1d
+
+
+@jit(nopython=True, nogil=True, parallel=False)
+def _bin_psd_hit_only(pixel_size, l_max, N):
+    '''similar to `_bin_psd` but with hit only
+
+    useful for reconstructing the hit counts later
+    '''
+    freq = fftfreq(N, pixel_size)
+    n = l_max + 1
+    hit = np.zeros(n, dtype=np.int64)
+
+    pi_2 = np.pi * 2.
+    for i in range(N):
+        freq_i = freq[i]
+        for j in range(N):
+            freq_j = freq[j]
+            l = int(round(pi_2 * np.sqrt(freq_i * freq_i + freq_j * freq_j)))
+            idx = l if l < l_max else l_max
+
+            hit[idx] += 1
+
+    hit = hit[:-1]
+
+    return hit
 
 # get pseudo-spectra ###########################################################
 

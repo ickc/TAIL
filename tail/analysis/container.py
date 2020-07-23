@@ -319,33 +319,37 @@ def rel_err_analytic_all(Cls, Nls, cross_to_auto_idxs, rel_dof=None):
     Both `Cls` and `Nls` should be 4d-array in this order:
     ('spectra', 'null_split', 'sub_split', 'l')
 
-    `rel_dof`: if not None, then in this order: ('spectra', 'l'). Cases where `rel_dof`
-    can depends on null-split isn't supported here (but easy to modify to support that case)
+    `rel_dof`: if not None, then in this order: ('spectra', 'null_split', 'sub_split', 'l').
 
     return: ('spectra', 'null_split', 'sub_split', 'l')
     '''
     n_spectra, n_null_split, n_sub_split, n_l = Cls.shape
     assert n_sub_split in (1, 3)
 
-    if rel_dof is not None:
-        assert rel_dof.ndim == 2
-        rel_dof_T = np.ascontiguousarray(rel_dof.T)
-        # after: ('l', 'spectra')
-
     # trapose for locality
+    if rel_dof is not None:
+        assert rel_dof.ndim == 4
+        # rel_dof might have n_null_split and n_subsplit equals 1
+        # in that case do broadcasting in these dimensions
+        rel_dof_broadcast = (rel_dof.shape[1] == 1) and (rel_dof.shape[2] == 1)
+        rel_dof_T = np.ascontiguousarray(rel_dof.transpose((1, 3, 2, 0)))
     Cls_T = np.ascontiguousarray(Cls.transpose((1, 3, 2, 0)))
     Nls_T = np.ascontiguousarray(Nls.transpose((1, 3, 2, 0)))
     # after: ('null_split', 'l', 'sub_split', 'spectra')
 
     res = np.empty_like(Cls_T)
     for i in prange(n_null_split):
+        if rel_dof is not None:
+            rel_dof_i = rel_dof_T[0] if rel_dof_broadcast else rel_dof_T[i]
         for j in range(n_l):
             if rel_dof is not None:
-                rel_dof_j = rel_dof_T[j]
+                rel_dof_ij = rel_dof_i[j]
             Cl_ij = Cls_T[i, j]
             Nl_ij = Nls_T[i, j]
             # sub_split
             for k in range(n_sub_split):
+                if rel_dof is not None:
+                    rel_dof_ijk = rel_dof_ij[0] if rel_dof_broadcast else rel_dof_ij[k]
                 # auto spectra within null-splits
                 if k < 2:
                     Cl_ijk = Cl_ij[k]
@@ -359,7 +363,7 @@ def rel_err_analytic_all(Cls, Nls, cross_to_auto_idxs, rel_dof=None):
                             Nl = Nl_ijk[l]
                             temp = rel_err_analytic_auto(Cl, Nl)
                             if rel_dof is not None:
-                                temp *= np.sqrt(2. / rel_dof_j[l])
+                                temp *= np.sqrt(2. / rel_dof_ijk[l])
                         # cross e.g. EB_0
                         else:
                             Cl12 = Cl_ijk[l]
@@ -369,7 +373,7 @@ def rel_err_analytic_all(Cls, Nls, cross_to_auto_idxs, rel_dof=None):
                             Nl22 = Nl_ijk[spectrum_idx2]
                             temp = rel_err_analytic_cross(Cl12, Cl11, Cl22, Nl11, Nl22)
                             if rel_dof is not None:
-                                temp *= np.power(rel_dof_j[spectrum_idx1] * rel_dof_j[spectrum_idx2], -0.25)
+                                temp *= np.power(rel_dof_ijk[spectrum_idx1] * rel_dof_ijk[spectrum_idx2], -0.25)
                         res[i, j, k, l] = temp
                 # k == 2: cross-spectra between null-splits
                 else:
@@ -385,7 +389,7 @@ def rel_err_analytic_all(Cls, Nls, cross_to_auto_idxs, rel_dof=None):
                             Nl22 = Nl_ij[1, l]
                             temp = rel_err_analytic_cross(Cl12, Cl11, Cl22, Nl11, Nl22)
                             if rel_dof is not None:
-                                temp /= np.sqrt(rel_dof_j[l])
+                                temp /= np.sqrt(rel_dof_ijk[l])
                         # cross of cross e.g. E_0 x B_1
                         else:
                             # 2 cases e.g. E_0 x B_1 and B_0 x E_1
@@ -407,7 +411,7 @@ def rel_err_analytic_all(Cls, Nls, cross_to_auto_idxs, rel_dof=None):
                             # here we assume they are iid Normal to propagate the error
                             temp = np.sqrt(temp * temp + temp2 * temp2) * 0.5
                             if rel_dof is not None:
-                                temp *= np.power(rel_dof_j[spectrum_idx1] * rel_dof_j[spectrum_idx2], -0.25)
+                                temp *= np.power(rel_dof_ijk[spectrum_idx1] * rel_dof_ijk[spectrum_idx2], -0.25)
                         res[i, j, k, l] = temp
     # back to ('spectra', 'null_split', 'sub_split', 'l')
     return np.ascontiguousarray(res.transpose((3, 0, 2, 1)))
@@ -418,13 +422,27 @@ def rel_err_analytic_all(Cls, Nls, cross_to_auto_idxs, rel_dof=None):
 class GenericSpectra(Generic, BinWidth):
     '''Essentially GenericSpectra is like anything in PseudoSpectra that's
     applicable to Spectra as well.
+
+    :param str ev_est: method used for the estimation of expected value. Valid input: signal/theory
+
+    if signal, estimated using the TTEE and TTBB no noise simulation. If theory, estimated using the
+    BPWF theory. Both methods should yeild identical results for TT, EE, BB due to the definition of
+    filter transfer function.
+
+    :param int ddof: if None, calculate err_mc using RMS of Cl_sim - ev, else use Cl_sim.std(axis=-1, ddof=ddof)
     '''
 
     names = ('spectra', 'null_split', 'sub_split', 'l', 'sub_spectra', 'n')
     meta_prefix = 'meta'
     rel_prefix = ''
 
-    def __init__(self, spectra, null_split, sub_spectra, **kwargs):
+    def __init__(
+        self,
+        spectra, null_split, sub_spectra,
+        l_min=0, l_max=None, bin_width=1,
+        ev_est='signal', ddof=None,
+        **kwargs
+    ):
         '''
         '''
         self.sub_spectra = sub_spectra
@@ -434,11 +452,13 @@ class GenericSpectra(Generic, BinWidth):
         for key, value in kwargs.items():
             setattr(self, key, value)
 
-        # this is hard-coded, basically the defaults of PseudoSpectra
-        self.l_min = 0
+        self.l_min = l_min
         # this is n_l
-        self.l_max = kwargs[self.map_cases[0]].shape[3]
-        self.bin_width = 1
+        self.l_max = kwargs[self.map_cases[0]].shape[3] if l_max is None else l_max
+        self.bin_width = bin_width
+
+        self.ev_est = ev_est
+        self.ddof = ddof
 
         self.is_full = self.get_is_full(null_split)
         self.null_split = ['full'] if self.is_full else null_split
@@ -450,11 +470,10 @@ class GenericSpectra(Generic, BinWidth):
     def get_is_full(null_split):
         ''' return True if `null_split` equals [None] or ['full']
         '''
-        if len(null_split) != 1:
-            return False
-        temp = null_split[0]
-        if temp is None or temp == 'full':
-            return True
+        if len(null_split) == 1:
+            temp = null_split[0]
+            if temp is None or temp == 'full':
+                return True
         return False
 
     @classmethod
@@ -463,6 +482,37 @@ class GenericSpectra(Generic, BinWidth):
             'full' if full else 'null',
             cls.rel_prefix
         ))
+
+    @property
+    def map_case_real(self):
+        map_cases = [map_case for map_case in self.map_cases if 'real' in map_case]
+        assert len(map_cases) == 1
+        map_case = map_cases[0]
+        print(f'Found 1 real spectra: {map_case}', file=sys.stderr)
+        return map_case
+
+    @property
+    def map_case_sim_noise(self):
+        '''get case of simulation with noise
+
+        e.g. 'simmap_TTEEBB_noise'
+        '''
+        map_cases = [map_case for map_case in self.map_cases if 'sim' in map_case and 'noise' in map_case]
+        assert len(map_cases) == 1
+        map_case = map_cases[0]
+        print(f'Found 1 simulated spectra with noise: {map_case}', file=sys.stderr)
+        return map_case
+
+    @property
+    def map_cases_sim_wo_noise(self):
+        '''get cases of simulation without noise
+
+        e.g. ['simmap_TTEE', 'simmap_TTBB']
+        '''
+        map_cases = [map_case for map_case in self.map_cases if 'sim' in map_case and 'noise' not in map_case]
+        assert len(map_cases) == 2
+        print(f'These 2 no noise simulations are found: {map_cases}. One should have TTEE only, another should have TTBB only.', file=sys.stderr)
+        return map_cases
 
     @classmethod
     def load_h5(cls, *args, **kwargs):
@@ -540,6 +590,18 @@ class GenericSpectra(Generic, BinWidth):
         df.columns.name = self.names[3]
         return df
 
+    def to_frame_3d(self, array_3d):
+        '''convert a 3d array to DataFrame representation where the
+        3d array is the first 3 dimensions of GenericSpectra (i.e. `self.names[:3]`)
+        '''
+        n_spectra, _, n_sub_split = array_3d.shape
+        df = pd.DataFrame(
+            array_3d.reshape(n_spectra, -1),
+            index=pd.Index(self.spectra, name=self.names[0]),
+            columns=pd.MultiIndex.from_product((self.null_split, map(str, range(n_sub_split))), names=self.names[1:3])
+        )
+        return df
+
     def save(self, path, compress_level=9):
         '''save object using HDF5 container
 
@@ -567,9 +629,13 @@ class GenericSpectra(Generic, BinWidth):
         4d array of the total signal with axes ('spectra', 'null_split',
         'sub_split', 'l')
         '''
-        map_cases = [map_case for map_case in self.map_cases if 'sim' in map_case and 'noise' not in map_case]
-        assert len(map_cases) == 2
-        print(f'These 2 no noise simulations are found to construct the total signal: {map_cases}. One should have TTEE only, another should have TTBB only.', file=sys.stderr)
+        # read from attributes if exist
+        _signal = getattr(self, '_signal', None)
+        if _signal is not None:
+            print('Using user-defined signal.', file=sys.stderr)
+            return _signal
+        # generate it if doesn't
+        map_cases = self.map_cases_sim_wo_noise
         Cl_signal = (
             getattr(self, map_cases[0])[:, :, :, :, 0, :].mean(axis=-1) +
             getattr(self, map_cases[1])[:, :, :, :, 0, :].mean(axis=-1)
@@ -578,6 +644,25 @@ class GenericSpectra(Generic, BinWidth):
         idx = get_idx(self.spectra, 'TT')
         Cl_signal[idx] *= 0.5
         return Cl_signal
+
+    @signal.setter
+    def signal(self, value):
+        self._signal = value
+
+    @signal.deleter
+    def signal(self):
+        _signal = getattr(self, '_signal', None)
+        if _signal is not None:
+            del self._signal
+
+    @property
+    def ev(self):
+        '''expected value
+        '''
+        try:
+            return self.signal if self.ev_est == 'signal' else self.theory
+        except AttributeError:
+            raise ValueError(f'Initialized with ev_est as {self.ev_est} but it does not exist. Likely the `theory` spectra is not assigned.')
 
     @property
     def leakage(self):
@@ -602,13 +687,11 @@ class GenericSpectra(Generic, BinWidth):
         }
         # it is convoluted to prevent multiple TTEE (or TTBB) no noise maps at the same time
         temp = dict()
-        for map_case in self.map_cases:
-            if 'simmaps' in map_case and 'noise' not in map_case:
-                print(f'No noise simulation {map_case} identified', file=sys.stderr)
-                for spectrum in lookup:
-                    if spectrum not in map_case:
-                        print(f'{map_case} has no {spectrum}...', file=sys.stderr)
-                        temp[spectrum] = map_case
+        for map_case in self.map_cases_sim_wo_noise:
+            for spectrum in lookup:
+                if spectrum not in map_case:
+                    print(f'{map_case} has no {spectrum}...', file=sys.stderr)
+                    temp[spectrum] = map_case
         cases = {map_case: lookup[spectrum] for spectrum, map_case in temp.items()}
         print(f'Determined to calculate leakage according to {cases}', file=sys.stderr)
 
@@ -638,24 +721,25 @@ class GenericSpectra(Generic, BinWidth):
             'BB': ('BB', 'EB', 'TB'),
             'EE': ('EB', 'EE', 'TB', 'TE')
         }
+        map_case_real = self.map_case_real
+        map_case_sim_noise = self.map_case_sim_noise
         # loop through no noise simulations
-        for map_case in self.map_cases:
-            if 'simmaps' in map_case and 'noise' not in map_case:
-                print(f'{map_case} identified as no noise simulation,', file=sys.stderr, end=' ')
-                # there should only be one match here per map_case
-                for spectrum_not_contained, spectra in lookup.items():
-                    if spectrum_not_contained not in map_case:
-                        print(f'which has no {spectrum_not_contained}, constructing {spectra} leakage from it...', file=sys.stderr)
-                        Cl = getattr(self, map_case)
-                        # loop through spectra
-                        for idx in get_idxs(self.spectra, spectra):
-                            leakage = Cl[idx, :, :, :, 0, :].mean(axis=-1)
-                            # loop through map_cases that should contain leakage from map_case
-                            for map_case_other in self.map_cases:
-                                if map_case_other == map_case or 'real' in map_case_other or 'noise' in map_case_other:
-                                    Cl_other = getattr(self, map_case_other)
-                                    print(f'Subtracting {self.spectra[idx]} leakage from {map_case_other}...', file=sys.stderr)
-                                    Cl_other[idx, :, :, :, 0, :] -= leakage[:, :, :, None]
+        for map_case in self.map_cases_sim_wo_noise:
+            print(f'{map_case} identified as no noise simulation,', file=sys.stderr, end=' ')
+            # there should only be one match here per map_case
+            for spectrum_not_contained, spectra in lookup.items():
+                if spectrum_not_contained not in map_case:
+                    print(f'which has no {spectrum_not_contained}, constructing {spectra} leakage from it...', file=sys.stderr)
+                    Cl = getattr(self, map_case)
+                    # loop through spectra
+                    for idx in get_idxs(self.spectra, spectra):
+                        leakage = Cl[idx, :, :, :, 0, :].mean(axis=-1)
+                        # loop through map_cases that should contain leakage from map_case
+                        for map_case_other in self.map_cases:
+                            if map_case_other in (map_case, map_case_real, map_case_sim_noise):
+                                Cl_other = getattr(self, map_case_other)
+                                print(f'Subtracting {self.spectra[idx]} leakage contributed by {map_case} from {map_case_other}...', file=sys.stderr)
+                                Cl_other[idx, :, :, :, 0, :] -= leakage[:, :, :, None]
 
     @property
     def cross_to_auto_idxs(self):
@@ -704,9 +788,7 @@ class GenericSpectra(Generic, BinWidth):
 
         if `rel_dust_spectra` is not None, MAP dust template will be subtracted too
         '''
-        map_cases = [map_case for map_case in self.map_cases if 'real' in map_case]
-        assert len(map_cases) == 1
-        map_case = map_cases[0]
+        map_case = self.map_case_real
         print(f'Transforming {map_case}...', file=sys.stderr)
         Cl = getattr(self, map_case)
 
@@ -717,19 +799,19 @@ class GenericSpectra(Generic, BinWidth):
     def scaling(self, compute_pwf=True, sim_noise_scaling=True, sim_noise_matching=True, angle=(np.pi / 5400.)):
         '''scaling with PWF and/or matching real and sim noise spectra inplace.
 
-        param bool compute_pwf: scaling the real data by pwf to correct for it. Here we assume
+        :param bool compute_pwf: scaling the real data by pwf to correct for it. Here we assume
         the PWF is slowly varying therefore we can correct this in pseudo-spectra for each l.
 
-        param bool sim_noise_scaling: scaling the noise spectra and the delta
+        :param bool sim_noise_scaling: scaling the noise spectra and the delta
         (relative to theory spectra) of the signal spectra of noise-simulation
 
-        param bool sim_noise_matching: match that of the real noise spectra
+        :param bool sim_noise_matching: match that of the real noise spectra
         after pwf correction. This is useful if there's noise spectra mismatch
         between real and sim. This should not happen, but can be a quick fix if
         real map is made slightly differently than simulated maps without redoing
         all simulations. (This indeed happened betwee v1 and v1.0.2 run.)
 
-        param float angle: angle used in calculating PWF if pwf is True. Default: 2 arcmin in radian.
+        :param float angle: angle used in calculating PWF if pwf is True. Default: 2 arcmin in radian.
 
         If `compute_pwf`: real spectra are scaled in place.
 
@@ -742,10 +824,7 @@ class GenericSpectra(Generic, BinWidth):
         has different pixel sizes in simulation.
         '''
         # get real spectra
-        map_cases = [map_case for map_case in self.map_cases if 'real' in map_case]
-        assert len(map_cases) == 1
-        map_case = map_cases[0]
-        print(f'Found 1 real spectra {map_case}', file=sys.stderr)
+        map_case = self.map_case_real
         Cl_real = getattr(self, map_case)
 
         if compute_pwf:
@@ -757,8 +836,7 @@ class GenericSpectra(Generic, BinWidth):
             # is also binned
             bin_width = getattr(self, 'bin_width', None)
             if bin_width is not None and bin_width != 1:
-                print(f'bin-width {bin_width} is not 1 and is unspported to correct for PWF.', sys.stderr)
-                raise ValueError
+                raise ValueError(f'bin-width {bin_width} is not 1 and is unspported to correct for PWF.')
 
             # get l-range
             l_min = self.l_min
@@ -783,13 +861,10 @@ class GenericSpectra(Generic, BinWidth):
         if sim_noise_scaling:
             assert tuple(self.sub_spectra) == ('Cl', 'Nl')
 
-            Cl_th = self.signal
+            Cl_th = self.ev
 
             # get sim-noise spectra
-            map_cases = [map_case for map_case in self.map_cases if 'sim' in map_case and 'noise' in map_case]
-            assert len(map_cases) == 1
-            map_case = map_cases[0]
-            print(f'Found 1 simulated spectra with noise: {map_case}', file=sys.stderr)
+            map_case = self.map_case_sim_noise
             Cl_sim = getattr(self, map_case)
 
             # determine scale
@@ -838,37 +913,127 @@ class GenericSpectra(Generic, BinWidth):
 
     @property
     def err_mc(self):
-        map_cases = [map_case for map_case in self.map_cases if 'sim' in map_case and 'noise' in map_case]
-        assert len(map_cases) == 1
-        map_case = map_cases[0]
+        # read from attributes if exist
+        _err_mc = getattr(self, '_err_mc', None)
+        if _err_mc is not None:
+            print('Using user-defined err_mc.', file=sys.stderr)
+            return _err_mc
+        # generate it if doesn't
+        map_case = self.map_case_sim_noise
         print(f'Using {map_case} to estimate MC error-bar', file=sys.stderr)
-        Cls = np.array([[[[0.]]]]) if isinstance(self, NullSpectra) else self.signal  # or self.theory[:, None, None, :] in conjunction with rel_err_analytic above
         Cl_sim = getattr(self, map_case)[:, :, :, :, 0]
-        return np.sqrt(np.square(Cl_sim - Cls[:, :, :, :, None]).mean(axis=-1))
+        if self.ddof is None:
+            print('Estimating MC error-bar using RMS of simulated spectra minus its expected value.', file=sys.stderr)
+            Cl_diff = Cl_sim if isinstance(self, NullSpectra) else Cl_sim - self.ev[:, :, :, :, None]
+            return np.sqrt(np.square(Cl_diff).mean(axis=-1))
+        else:
+            print(f'Estimating MC error-bar using standard deviation of simulated spectra with ddof of {self.ddof}.', file=sys.stderr)
+            return Cl_sim.std(axis=-1, ddof=self.ddof)
+
+    @err_mc.setter
+    def err_mc(self, value):
+        self._err_mc = value
+
+    @err_mc.deleter
+    def err_mc(self):
+        _err_mc = getattr(self, '_err_mc', None)
+        if _err_mc is not None:
+            del self._err_mc
 
     @property
-    def pte(self):
-        map_cases = [map_case for map_case in self.map_cases if 'sim' in map_case and 'noise' in map_case]
-        assert len(map_cases) == 1
-        map_case = map_cases[0]
-        print(f'Found noise simulation {map_case}', file=sys.stderr)
+    def chi(self):
+        '''chi assuming fiducial theory
+        '''
+        map_case = self.map_case_sim_noise
         Cl_sims = getattr(self, map_case)[:, :, :, :, 0]
 
-        map_cases = [map_case for map_case in self.map_cases if 'real' in map_case]
-        assert len(map_cases) == 1
-        map_case = map_cases[0]
-        print(f'Found real spectra {map_case}', file=sys.stderr)
-        Cl_real = getattr(self, map_case)[:, :, :, :, 0, 0]
+        map_case = self.map_case_real
+        Cl_real = getattr(self, map_case)[:, :, :, :, 0]
 
-        err = self.err_mc
+        err = self.err_mc[..., None]
+        signal = self.ev[..., None]
 
-        chi_real = Cl_real / err
-        chi_sims = Cl_sims / err[:, :, :, :, None]
+        chi_real = (Cl_real - signal) / err
+        chi_sims = (Cl_sims - signal) / err
+        return chi_real, chi_sims
+
+    @property
+    def chis(self):
+        '''sum of chi-square assuming fiducial theory
+        '''
+        chi_real, chi_sims = self.chi
 
         chi_sq_real = np.square(chi_real).sum(axis=3)
         chi_sq_sims = np.square(chi_sims).sum(axis=3)
+        return chi_sq_real, chi_sq_sims
 
-        return (chi_sq_real[:, :, :, None] < chi_sq_sims).mean(axis=3)
+    @property
+    def chi_null(self):
+        '''chi assuming null'''
+        map_case = self.map_case_sim_noise
+        Cl_sims = getattr(self, map_case)[:, :, :, :, 0]
+
+        map_case = self.map_case_real
+        Cl_real = getattr(self, map_case)[:, :, :, :, 0]
+
+        err = self.err_mc[..., None]
+
+        chi_real = Cl_real / err
+        chi_sims = Cl_sims / err
+        return chi_real, chi_sims
+
+    @property
+    def chis_null(self):
+        '''sum of chi-square assuming null'''
+        chi_real, chi_sims = self.chi_null
+
+        chi_sq_real = np.square(chi_real).sum(axis=3)
+        chi_sq_sims = np.square(chi_sims).sum(axis=3)
+        return chi_sq_real, chi_sq_sims
+
+    @property
+    def pte(self):
+        chi_sq_real, chi_sq_sims = self.chis
+        return (chi_sq_real < chi_sq_sims).mean(axis=3)
+
+    @property
+    def pte_null(self):
+        chi_sq_real, chi_sq_sims = self.chis_null
+        return (chi_sq_real < chi_sq_sims).mean(axis=3)
+
+    @property
+    def pte_iid(self):
+        from scipy.stats import chi2
+
+        n = len(self.b_range)
+        dist = chi2(n)
+        chi_sq_real, chi_sq_sims = self.chis
+        return dist.sf(chi_sq_real[..., 0])
+
+    @property
+    def pte_null_iid(self):
+        from scipy.stats import chi2
+
+        n = len(self.b_range)
+        dist = chi2(n)
+        chi_sq_real, chi_sq_sims = self.chis_null
+        return dist.sf(chi_sq_real[..., 0])
+
+    @property
+    def pte_to_frame(self):
+        return self.to_frame_3d(self.pte)
+
+    @property
+    def pte_null_to_frame(self):
+        return self.to_frame_3d(self.pte_null)
+
+    @property
+    def pte_iid_to_frame(self):
+        return self.to_frame_3d(self.pte_iid)
+
+    @property
+    def pte_null_iid_to_frame(self):
+        return self.to_frame_3d(self.pte_null_iid)
 
     def _df_for_plot(self, subtract_leakage=True):
         err_mc = self.err_mc
@@ -878,12 +1043,9 @@ class GenericSpectra(Generic, BinWidth):
             print('Found err_mcmc. MCMC error and MC error will be combined assuming idependent Gaussian.', file=sys.stderr)
             err_mc = np.sqrt(np.square(err_mc) + np.square(err_mcmc))
 
-        map_cases = [map_case for map_case in self.map_cases if 'real' in map_case]
-        assert len(map_cases) == 1
-        map_case = map_cases[0]
-        print(f'Found measured spectra from map-case {map_case}.', file=sys.stderr)
-        Cl = getattr(self, map_case)[:, :, :, :, 0, 0]
-        signal = self.signal
+        map_case = self.map_case_real
+        Cl = getattr(self, map_case)[:, :, :, :, 0, 0].copy()
+        signal = self.ev
 
         if subtract_leakage:
             leakage = self.leakage
@@ -926,10 +1088,7 @@ class GenericSpectra(Generic, BinWidth):
         if err_mcmc is None:
             raise RuntimeError('err_mcmc not exist. Consider running ComputeLikelihood.err_mcmc_to_spectra')
 
-        map_cases = [map_case for map_case in self.map_cases if 'real' in map_case]
-        assert len(map_cases) == 1
-        map_case = map_cases[0]
-        print(f'Found measured spectra from map-case {map_case}.', file=sys.stderr)
+        map_case = self.map_case_real
         Cl = getattr(self, map_case)[:, :, :, :, 0, 0]
 
         df = pd.DataFrame({
@@ -946,6 +1105,34 @@ class GenericSpectra(Generic, BinWidth):
         import plotly.express as px
 
         return px.scatter(self._df_for_plot_err_mcmc(), x='l', y='Cl', error_x='err_l', color='spectra', symbol='case', title='MCMC error-bar vs. MC error-bar with measured spectra')
+
+    def inverse_variance_weighting_downsampling(self, m: int):
+        '''combine bins in-place weighted inverse variancely'''
+        err_mc = self.err_mc
+
+        err_mcmc = getattr(self, 'err_mcmc', None)
+        if err_mcmc is not None:
+            print('Found err_mcmc. MCMC error and MC error will be combined assuming idependent Gaussian.', file=sys.stderr)
+            err_mc = np.sqrt(np.square(err_mc) + np.square(err_mcmc))
+
+        n_spectra, n_null_split, n_sub_split, n_l = err_mcmc.shape
+        assert n_l % m == 0
+
+        inverse_variance = np.reciprocal(np.square(err_mc))
+
+        denom = inverse_variance.reshape(n_spectra, n_null_split, n_sub_split, n_l // m, m).sum(axis=-1)
+
+        for map_case in self.map_cases:
+            Cl = getattr(self, map_case)
+
+        num = (Cl * inverse_variance).reshape(n_spectra, n_null_split, n_sub_split, n_l // m, m)
+
+        self.bin_width *= m
+        if err_mcmc is not None:
+            # compute new err_mcmc from new err_mc...
+        # TODO
+            raise NotImplementedError
+        raise NotImplementedError
 
 
 class PseudoSpectra(GenericSpectra):
@@ -1069,8 +1256,7 @@ class PseudoSpectra(GenericSpectra):
                 'h5': cls.load_h5,
             }
         except AttributeError:
-            print(f'spec {spec} is not implemented in {cls}.', file=sys.stderr)
-            raise NotImplementedError
+            raise NotImplementedError(f'spec {spec} is not implemented in {cls}.')
         return method[spec](paths, **kwargs)
 
     def save(self, path, compress_level=9):
@@ -1084,6 +1270,32 @@ class PseudoSpectra(GenericSpectra):
                 h5_check_before_create(f, f'{self.meta_prefix}/{case}', getattr(self, case), compress_level=compress_level)
             for case in self.map_cases:
                 h5_check_before_create(f, f'{self.prefix}/{case}', getattr(self, case), compress_level=compress_level)
+
+    def slicing_l(self, l_min, l_max, ascontiguousarray=False):
+        '''return a PseudoSpectra that is sliced with the given l-range
+
+        :param bool ascontiguousarray: if True, return contiguous arrays
+        when sliced. Note that this means it is not a view on the original
+        array anymore.
+
+        Warning: it is not fully implemented everywhere.
+        '''
+        if l_min != 0:
+            print('Warning: PseudoSpectra may not behave well for l_min != 0 case.', file=sys.stderr)
+
+        l_slice = self.l_slice(l_min, l_max)
+
+        kwargs = {map_case: getattr(self, map_case)[:, :, :, l_slice] for map_case in self.map_cases}
+        if ascontiguousarray:
+            kwargs = {key: np.ascontiguousarray(value) for key, value in kwargs.items()}
+
+        return PseudoSpectra(
+            self.spectra, self.null_split, self.sub_spectra,
+            l_min=self.l_min, l_max=self.l_max, bin_width=self.bin_width,
+            ev_est=self.ev_est, ddof=self.ddof,
+            **kwargs
+        )
+
 
     def transform_for_filter_transfer(self, l_min, l_max, cases):
         '''transform the array in a format needed by `.filter_transfer.ComputeFilterTransfer`
@@ -1243,29 +1455,22 @@ class BeamSpectra(GenericDataFrameContainer):
         }
         return method[spec](path, **kwargs)
 
-    def squared_interp(self, l_min, l_max, uncertainties=False):
+    def squared_interp(self, l_min, l_max):
         '''return the squared beam, interp over the interval [l_min, l_max)
 
         used in ComputeFilterTransfer for example
         '''
-        from .helper import complex_to_uncertainties
-
-        B = (
-            complex_to_uncertainties(
-                np.interp(range(l_min, l_max), self.l, self.all)
-            )
-        ) if uncertainties else (
-            np.interp(range(l_min, l_max), self.l, self.all.real)
-        )
-        return np.square(B)
+        return np.square(np.interp(range(l_min, l_max), self.l, self.all.real))
 
 
 def get_theory(theory_spectra: TheorySpectra, w_bl, l_min, l_max, spectra):
-    if w_bl.ndim != 3:
-        print('Did not implement the case where w_bl can depends on null-splits yet.', file=sys.stderr)
-        raise NotImplementedError
     ths = theory_spectra.packing(l_min, l_max, spectra)
-    return np.einsum('ijk,ik->ij', w_bl, ths)
+    if w_bl.ndim == 3:
+        return np.einsum('ijk,ik->ij', w_bl, ths)
+    elif w_bl.ndim == 5:
+        return np.einsum('ilmjk,ik->ilmj', w_bl, ths)
+    else:
+        raise ValueError(f'Cannot handle w_bl with ndim = {w_bl.ndim}.')
 
 
 class Spectra(GenericSpectra):
@@ -1277,20 +1482,23 @@ class Spectra(GenericSpectra):
         self,
         spectra, null_split, sub_spectra,
         l_min, l_max, bin_width,
+        ev_est='signal', ddof=None,
         w_bl=None,
-        rel_err=None,
         right=False,
+        filter_divided_from_spectra=False,
         theory=None,
         **kwargs
     ):
         # in addtion to the vars above, this adds self.is_full, self.cases, self.prefix
-        super().__init__(spectra, null_split, sub_spectra, **kwargs)
-        self.l_min = l_min
-        self.l_max = l_max
-        self.bin_width = bin_width
+        super().__init__(
+            spectra, null_split, sub_spectra,
+            l_min=l_min, l_max=l_max, bin_width=bin_width,
+            ev_est=ev_est, ddof=ddof,
+            **kwargs
+        )
         self.w_bl = w_bl
-        self.rel_err = rel_err
         self.right = right
+        self.filter_divided_from_spectra = filter_divided_from_spectra
         self.theory = theory
 
     @property
@@ -1304,7 +1512,7 @@ class Spectra(GenericSpectra):
             return df
 
     @staticmethod
-    @jit(float64[:, ::1](float64[:, :, ::1], int32, int32), nopython=True, nogil=True)
+    @jit(float64[:, ::1](float64[:, :, ::1], int32, int32), nopython=True, nogil=True, parallel=True)
     def get_rel_dof(w_bl, l_min, bin_width):
         '''calculate the total dof in a bin given w_bl relative to full sky coverage
 
@@ -1312,10 +1520,10 @@ class Spectra(GenericSpectra):
 
         return a 2d-array with this order: ('spectra', 'b')
         '''
-        n_spectra, n_b, n_l = w_bl.shape
-        res = np.empty((n_spectra, n_b), dtype=w_bl.dtype)
+        n, n_b, n_l = w_bl.shape
+        res = np.empty((n, n_b), dtype=w_bl.dtype)
         two_times_l_min_plus_1 = 2 * l_min + 1
-        for i in range(n_spectra):
+        for i in prange(n):
             for b in range(n_b):
                 nu_pos = 0.
                 nu_neg = 0.
@@ -1331,16 +1539,20 @@ class Spectra(GenericSpectra):
 
     @property
     def rel_dof(self):
-        return None if self.w_bl is None else self.get_rel_dof(self.w_bl, self.l_min, self.bin_width)
+        w_bl = self.w_bl
+        if w_bl is None:
+            return None
+        else:
+            shape = w_bl.shape
+            _, _, _, n_b, n_l = shape
+            res = self.get_rel_dof(w_bl.reshape((-1, n_b, n_l)), self.l_min, self.bin_width)
+            return res.reshape(shape[:-1])
 
     @property
     def rel_err_analytic(self):
-        map_cases = [map_case for map_case in self.map_cases if 'real' in map_case]
-        assert len(map_cases) == 1
-        map_case = map_cases[0]
+        map_case = self.map_case_real
         print(f'Using noise spectra from {map_case} to estimate analytical error-bar', file=sys.stderr)
-        # or self.theory[:, None, None, :] in conjunction with err_mc below (beware of Cls, Nls shape mis-match if not self.is_full)
-        Cls = self.signal
+        Cls = self.ev
         Nls = getattr(self, map_case)[:, :, :, :, 1, 0]
         return rel_err_analytic_all(Cls, Nls, self.cross_to_auto_idxs, rel_dof=self.rel_dof)
 
@@ -1368,12 +1580,9 @@ class Spectra(GenericSpectra):
             for case in self.map_cases:
                 h5_check_before_create(f, f'{self.prefix}/{subdir}/map_cases/{case}', getattr(self, case), compress_level=compress_level)
 
-            if self.rel_err is not None:
-                h5_check_before_create(f, f'{self.prefix}/{subdir}/rel_err', self.rel_err, compress_level=compress_level)
             if self.w_bl is not None:
-                # w_bl: same for both full and null if not right
-                # if not right then override this and put in the full dir instead
-                prefix = f'full/{self.rel_prefix}' if (not self.is_full and not self.right) else self.prefix
+                # w_bl: same for both full and null if it doesn't depends on null dimensions
+                prefix = f'full/{self.rel_prefix}' if ((self.w_bl.shape[1] == 1) and (self.w_bl.shape[2] == 1)) else self.prefix
                 h5_check_before_create(f, f'{prefix}/{subdir}/w_bl', self.w_bl, compress_level=compress_level)
 
             # right is already saved in filter_transfer in `f['meta/filter_transfer'][1].astype(np.unicode_) == 'right'
@@ -1433,7 +1642,6 @@ class Spectra(GenericSpectra):
             kwargs = {case: f[case][:] for case in map_cases}
 
             f = file[f'{prefix}/{subdir}']
-            rel_err = f['rel_err'][:] if 'rel_err' in f else None
 
             if 'meta/filter_transfer' in file:
                 right = file['meta/filter_transfer'][1].astype(np.unicode_) == 'right'
@@ -1443,8 +1651,8 @@ class Spectra(GenericSpectra):
 
             # w_bl: same for both full and null if not right
             # if not right then override this and put in the full dir instead
-            if (not full and not right):
-                f = file[f'full/{cls.rel_prefix}/{subdir}']
+            if (not full and f'null/{cls.rel_prefix}/{subdir}' in file):
+                f = file[f'null/{cls.rel_prefix}/{subdir}']
             w_bl = f['w_bl'][:] if 'w_bl' in f else None
 
         # theory
@@ -1461,11 +1669,99 @@ class Spectra(GenericSpectra):
             spectra, null_split, sub_spectra,
             l_min, l_max, bin_width,
             w_bl=w_bl,
-            rel_err=rel_err,
             right=right,
             theory=theory,
             **kwargs
         )
+
+    @staticmethod
+    def load_h5_pandas_to_frame(path):
+        '''load from HDF5 files with pandas
+
+        legacy pandas container spec
+        '''
+        df = pd.read_hdf(path, 'spectra')
+
+        # pandas doesn't save columns name to HDF5
+        df.columns.name = 'l'
+
+        # convert to microK
+        df *= 1e12
+        df.sort_index(inplace=True)
+
+        df_w = pd.read_hdf(path, 'window')
+        return df, df_w
+
+    @classmethod
+    def load_pandas(cls, df, df_w, remove_null_in_map_case=True, **kwargs):
+        from dautil.pandas_util import df_to_ndarray
+
+        map_cases = tuple(df.index.get_level_values('map_case').unique())
+
+        sub_spectra = ('Cl', 'Nl')
+        spectra = None
+        null_split = None
+        l_min = None
+        l_max = None
+        bin_width = None
+        kwargs = dict()
+
+        for map_case in map_cases:
+            if map_case == 'theory':
+                break
+            # the transpose is to put the column dimension in the last array dimension
+            # as pandas' column is contiguous
+            # names: ('sub_spectra', 'spectra', 'sub_split', 'null_split', 'n', 'l')
+            values, levels, names = df_to_ndarray(df.xs(map_case, level='map_case').T, unique=True)
+
+            assert tuple(names) == ('spectra', 'sub_split', 'null_split', 'n', 'l')
+        #     assert set(names) == set(cls.names)
+
+            # check all map_case shares the same sub_spectra, spectra, null_split
+            if spectra is None:
+                spectra = tuple(levels[0])
+            else:
+                assert spectra == tuple(levels[0])
+            if null_split is None:
+                null_split = tuple(levels[2])
+            else:
+                assert null_split == tuple(levels[2])
+
+            ls = levels[4]
+            bin_widths = np.unique(np.diff(ls))
+            assert bin_widths.size == 1
+            bin_width = int(bin_widths[0])
+            l_min = np.round(ls[0] + 0.5).astype(np.int) - bin_width // 2
+            l_max = np.round(ls[-1] + 0.5).astype(np.int) + bin_width // 2
+
+            # check that sub_split, n, l are just trivial arange
+            for i in (3,):
+                np.testing.assert_array_equal(levels[i].values.astype(np.int), np.arange(values.shape[i]))
+
+            # in the past null_ is hard-coded in the beginning
+            map_case_new = map_case[5:] if remove_null_in_map_case and map_case.startswith('null_') else map_case
+            # new order: ('spectra', 'null_split', 'sub_split', 'l', 'sub_spectra', 'n')
+            temp = values.transpose((0, 2, 1, 4, 3))
+            kwargs[map_case_new] = np.stack((temp.real, temp.imag), axis=4)
+
+        w_bl = np.stack([df_w.xs((spectrum, '0', 'full')).values for spectrum in spectra])
+        if 'theory' in map_cases:
+            df_th = df.xs(('theory', '0', 'full', 0), level=('map_case', 'sub_split', 'null_split', 'n')).apply(np.real).T
+            df_th['EB'] = 0.
+            df_th['TB'] = 0.
+            theory = np.stack([df_th[spectrum].values for spectrum in spectra])
+        else:
+            theory = None
+        return cls(np.array(spectra), np.array(null_split), np.array(sub_spectra), l_min, l_max, bin_width, w_bl=w_bl, theory=theory, **kwargs)
+
+    @classmethod
+    def load_h5_pandas(cls, path, **kwargs):
+        '''load from HDF5 files with pandas
+
+        legacy pandas container spec
+        '''
+        df, df_w = cls.load_h5_pandas_to_frame(path)
+        return cls.load_pandas(df, df_w)
 
     def slicing_l(self, l_min, l_max, ascontiguousarray=False):
         '''return a Spectra that is sliced with the given l-range
@@ -1482,19 +1778,13 @@ class Spectra(GenericSpectra):
         w_bl = self.w_bl
         if w_bl is not None:
             l_slice = self.l_slice(l_min, l_max)
-            w_bl = w_bl[:, b_slice][:, :, l_slice]
+            w_bl = w_bl[:, :, :, b_slice][:, :, :, :, l_slice]
             if ascontiguousarray:
                 w_bl = np.ascontiguousarray(w_bl)
 
-        rel_err = self.rel_err
-        if rel_err is not None:
-            rel_err = rel_err[:, :, :, b_slice]
-            if ascontiguousarray:
-                rel_err = np.ascontiguousarray(rel_err)
-
         theory = self.theory
         if theory is not None:
-            theory = theory[:, b_slice]
+            theory = theory[:, :, :, b_slice]
             if ascontiguousarray:
                 theory = np.ascontiguousarray(theory)
 
@@ -1505,9 +1795,10 @@ class Spectra(GenericSpectra):
         return Spectra(
             self.spectra, self.null_split, self.sub_spectra,
             l_min, l_max, self.bin_width,
+            ev_est=self.ev_est, ddof=self.ddof,
             w_bl=w_bl,
-            rel_err=rel_err,
             right=self.right,
+            filter_divided_from_spectra=self.filter_divided_from_spectra,
             theory=theory,
             **kwargs
         )
@@ -1520,7 +1811,6 @@ class NullSpectra(Spectra):
         spectra, null_split, sub_spectra,
         l_min, l_max, bin_width,
         w_bl=None,
-        rel_err=None,
         right=False,
         theory=None,
         err_analytic=None,
@@ -1530,7 +1820,6 @@ class NullSpectra(Spectra):
             spectra, null_split, sub_spectra,
             l_min, l_max, bin_width,
             w_bl=w_bl,
-            rel_err=rel_err,
             right=right,
             theory=theory,
             **kwargs
@@ -1583,12 +1872,31 @@ class NullSpectra(Spectra):
             spectra.spectra, spectra.null_split, spectra.sub_spectra[:1],
             spectra.l_min, spectra.l_max, spectra.bin_width,
             w_bl=spectra.w_bl,
-            rel_err=spectra.rel_err,
             right=spectra.right,
             theory=None,  # NullSpectra always has theory expectation of 0
             err_analytic=err_combined,
             **kwargs
         )
+
+    def _df_for_plot(self):
+        err_mc = self.err_mc
+        map_case = self.map_case_real
+        Cl = getattr(self, map_case)[:, :, :, :, 0, 0]
+
+        df = self.to_frame_4d(Cl + err_mc * 1.j).droplevel(2).T
+        df.index += 0.5j * self.bin_width
+        return df
+
+    def plot_spectra(self):
+        '''plot real spectra and expected (signal) spectra with MC error-bar
+
+        for log scale, try
+
+        >>> fig.update_layout(xaxis_type="log", yaxis_type="log")
+        '''
+        from dautil.plot import iplot_column_slider
+
+        return iplot_column_slider(self._df_for_plot(), mode='markers')
 
 
 class FilterTransfer(Generic):
@@ -1702,22 +2010,14 @@ class FilterTransfer(Generic):
             l_min, l_max, bin_width
         )
 
-    def solve(self, spectra, uncertainties=False):
+    def solve(self, spectra):
         '''calculate filter transfer functions for cross spectra too
 
         param spectra: list of spectrum such as EE, TE, TB, etc. `self.cases`
         is auto-spectra only. And cross-spectra are calculated using sqrt of
         product of auto-spectra
         '''
-        if uncertainties:
-            from .helper import complex_to_uncertainties
-            from uncertainties import unumpy as up
-
-            Fs = complex_to_uncertainties(self.Fs)
-            sqrt = up.sqrt
-        else:
-            Fs = self.Fs.real
-            sqrt = np.sqrt
+        Fs = self.Fs.real
 
         shape = list(Fs.shape)
         shape[0] = len(spectra)
@@ -1732,5 +2032,5 @@ class FilterTransfer(Generic):
             # if not calculated explicitly, estimate from that of auto-spectra
             # e.g. EB, TB
             else:
-                res[i] = sqrt(F_dict[spectrum_0 * 2] * F_dict[spectrum_1 * 2])
+                res[i] = np.sqrt(F_dict[spectrum_0 * 2] * F_dict[spectrum_1 * 2])
         return res

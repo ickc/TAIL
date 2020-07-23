@@ -114,6 +114,7 @@ setup(
     entry_points={
         'console_scripts': [
             'iterative_map = tail.pipeline.iterative_map:cli',
+            'solve_spectra = tail.pipeline.solve_spectra:cli',
             # see pairs below
             'collect_weight_db = tail.pipeline.collect_weight_db:cli',
             'mask = tail.pipeline.mask:cli',

@@ -73,7 +73,7 @@ def from_spectra_matrix(array, spectra, cases=SPECTRA_MATRIX_ORDER):
 
 
 def get_rel_dust_spectra(spectra: Spectra):
-    w_bl = spectra.w_bl[get_idx(spectra.spectra, 'BB')]
+    w_bl = spectra.w_bl[get_idx(spectra.spectra, 'BB'), 0, 0]
     l_min = spectra.l_min
     l_max = spectra.l_max
 
@@ -101,15 +101,18 @@ def beam_err(sigma_sq, l_min, l_max, bin_width):
     return _beam_err(sigma_sq, l_min, bin_width, n_b, bin_width_inverse)
 
 
-@jit(float64[:, :, ::1](float64, float64[:, :, ::1]), nopython=True, nogil=True, cache=True)
-def scale_by_amplitude_parameter(theta, array):
+@jit(float64[:, :, ::1](float64, float64[:, :, ::1], float64[::1]), nopython=True, nogil=True, cache=True)
+def scale_by_amplitude_parameter(theta, theory_spectra, leakage_spectra_BB):
     '''scale the theory BB spectra
 
     `theta`: A_BB
-    `array`: spectra in matrix form
+    `theory_spectra`: spectra in matrix form
+    `leakage_spectra_BB`: BB leakage which won't scale with A_BB
     '''
-    res = array.copy()
+    res = theory_spectra.copy()
+    res[:, 2, 2] -= leakage_spectra_BB
     res[:, 2, 2] *= theta
+    res[:, 2, 2] += leakage_spectra_BB
     return res
 
 
@@ -302,8 +305,8 @@ def prior(θ):
     )
 
 
-@jit(float64(float64[::1], complex128[:, :, ::1], float64[:, :, ::1], float64[::1], float64[::1], int32, int32, int32), nopython=True, nogil=True, cache=True)
-def log_likelihood(thetas, obs_spectra, theory_spectra, rel_dust_spectra, dof, l_min, l_max, bin_width):
+@jit(float64(float64[::1], complex128[:, :, ::1], float64[:, :, ::1], float64[::1], float64[::1], float64[::1], int32, int32, int32, int32), nopython=True, nogil=True, cache=True)
+def log_likelihood(thetas, obs_spectra, theory_spectra, leakage_spectra_BB, rel_dust_spectra, dof, l_min, l_max, bin_width, l_T_cutoff_idx):
     '''
     thetas[0] = A_BB
     thetas[1] = a_T
@@ -311,13 +314,15 @@ def log_likelihood(thetas, obs_spectra, theory_spectra, rel_dust_spectra, dof, l
     thetas[3] = theta
     thetas[4] = sigma_sq
     thetas[5] = A_dust
+
+    :param int l_T_cutoff_idx: drop TT, TE, TB beyond to this threshold, in terms of the b-th bin index. Set this to -1 to disable this behavior
     '''
     if not prior(thetas):
         return -np.inf
 
     # complex, real is signal, imag is noise
     C_total_est_complex = inverse_transform(thetas[1:5], obs_spectra, l_min, l_max, bin_width)
-    C_total = scale_by_amplitude_parameter(thetas[0], theory_spectra)
+    C_total = scale_by_amplitude_parameter(thetas[0], theory_spectra, leakage_spectra_BB)
 
     Nb = C_total_est_complex.imag
     C_total_est = C_total_est_complex.real + Nb
@@ -332,27 +337,36 @@ def log_likelihood(thetas, obs_spectra, theory_spectra, rel_dust_spectra, dof, l
     C_total[:, 2, 2] += thetas[5] * rel_dust_spectra
 
     res = 0.
-    for b in range(n):
+    # invalid l_T_cutoff_idx is considered to be disabling this cutoff
+    if not (0 <= l_T_cutoff_idx <= n):
+        l_T_cutoff_idx = n
+    # TEB
+    for b in range(l_T_cutoff_idx):
         # C-est times C-inverse
         temp = np.linalg.solve(C_total[b], C_total_est[b])
         res += dof[b] * (np.trace(temp) - np.log(np.linalg.det(temp)) - 3.)
+    # EB only
+    for b in range(l_T_cutoff_idx, n):
+        # C-est times C-inverse
+        temp = np.linalg.solve(C_total[b, 1:][:, 1:], C_total_est[b, 1:][:, 1:])
+        res += dof[b] * (np.trace(temp) - np.log(np.linalg.det(temp)) - 2.)
     # dust: Guassian likelihood
     res += ((thetas[5] - DUST_AMP) / DUST_AMP_STD)**2
 
     return -0.5 * res
 
 
-@jit(float64(float64[::1], complex128[:, :, ::1], float64[:, :, ::1], float64[::1], float64[::1], int32, int32, int32), nopython=True, nogil=True, cache=True)
-def neg_log_likelihood(thetas, obs_spectra, theory_spectra, rel_dust_spectra, dof, l_min, l_max, bin_width):
+@jit(float64(float64[::1], complex128[:, :, ::1], float64[:, :, ::1], float64[::1], float64[::1], float64[::1], int32, int32, int32, int32), nopython=True, nogil=True, cache=True)
+def neg_log_likelihood(thetas, obs_spectra, theory_spectra, leakage_spectra_BB, rel_dust_spectra, dof, l_min, l_max, bin_width, l_T_cutoff_idx):
     '''negative log-likelihood
 
     mainly for scipy.optimize.minimize
     '''
-    return -log_likelihood(thetas, obs_spectra, theory_spectra, rel_dust_spectra, dof, l_min, l_max, bin_width)
+    return -log_likelihood(thetas, obs_spectra, theory_spectra, leakage_spectra_BB, rel_dust_spectra, dof, l_min, l_max, bin_width, l_T_cutoff_idx)
 
 
-@jit(float64(float64[::1], float64, complex128[:, :, ::1], float64[:, :, ::1], float64[::1], float64[::1], int32, int32, int32), nopython=True, nogil=True, cache=True)
-def neg_log_likelihood_fixed(thetas, A_BB, obs_spectra, theory_spectra, rel_dust_spectra, dof, l_min, l_max, bin_width):
+@jit(float64(float64[::1], float64, complex128[:, :, ::1], float64[:, :, ::1], float64[::1], float64[::1], float64[::1], int32, int32, int32, int32), nopython=True, nogil=True, cache=True)
+def neg_log_likelihood_fixed(thetas, A_BB, obs_spectra, theory_spectra, leakage_spectra_BB, rel_dust_spectra, dof, l_min, l_max, bin_width, l_T_cutoff_idx):
     '''fixing A_BB in the likelihood
 
     mainly for scipy.optimize.minimize
@@ -361,14 +375,14 @@ def neg_log_likelihood_fixed(thetas, A_BB, obs_spectra, theory_spectra, rel_dust
     thetas_null = np.empty(n + 1)
     thetas_null[0] = A_BB
     thetas_null[1:] = thetas
-    return -log_likelihood(thetas_null, obs_spectra, theory_spectra, rel_dust_spectra, dof, l_min, l_max, bin_width)
+    return -log_likelihood(thetas_null, obs_spectra, theory_spectra, leakage_spectra_BB, rel_dust_spectra, dof, l_min, l_max, bin_width, l_T_cutoff_idx)
 
 
-@jit(float64(float64[::1], float64[::1], complex128[:, :, ::1], float64[:, :, ::1], float64[::1], float64[::1], int32, int32, int32), nopython=True, nogil=True, cache=True)
-def likelihood_ratio(theta_hyp, theta, obs_spectra, theory_spectra, rel_dust_spectra, dof, l_min, l_max, bin_width):
+@jit(float64(float64[::1], float64[::1], complex128[:, :, ::1], float64[:, :, ::1], float64[::1], float64[::1], float64[::1], int32, int32, int32, int32), nopython=True, nogil=True, cache=True)
+def likelihood_ratio(theta_hyp, theta, obs_spectra, theory_spectra, leakage_spectra_BB, rel_dust_spectra, dof, l_min, l_max, bin_width, l_T_cutoff_idx):
     return -2. * (
-        log_likelihood(theta_hyp, obs_spectra, theory_spectra, rel_dust_spectra, dof, l_min, l_max, bin_width) -
-        log_likelihood(theta, obs_spectra, theory_spectra, rel_dust_spectra, dof, l_min, l_max, bin_width)
+        log_likelihood(theta_hyp, obs_spectra, theory_spectra, leakage_spectra_BB, rel_dust_spectra, dof, l_min, l_max, bin_width, l_T_cutoff_idx) -
+        log_likelihood(theta, obs_spectra, theory_spectra, leakage_spectra_BB, rel_dust_spectra, dof, l_min, l_max, bin_width, l_T_cutoff_idx)
     )
 
 
@@ -398,18 +412,25 @@ def err_likelihood(thetas_all, Cl, Cl_map, rel_dust_spectra, l_min, l_max, bin_w
 
 class ComputeLikelihood(object):
 
-    def __init__(self, spectra: Spectra, obs_spectra, theory_spectra, rel_dust_spectra, dof, l_min, l_max, bin_width):
+    def __init__(self, spectra: Spectra, obs_spectra, theory_spectra, leakage_spectra_BB, rel_dust_spectra, dof, l_min, l_max, bin_width, l_T_cutoff=None):
         self.spectra = spectra
         self.obs_spectra = obs_spectra
         self.theory_spectra = theory_spectra
+        self.leakage_spectra_BB = leakage_spectra_BB
         self.rel_dust_spectra = rel_dust_spectra
         self.dof = dof
         self.l_min = l_min
         self.l_max = l_max
         self.bin_width = bin_width
+        if l_T_cutoff is None:
+            self.l_T_cutoff_idx = -1
+        else:
+            # included only if the whole bin is <= l_T_cutoff
+            self.l_T_cutoff_idx = (l_T_cutoff + 1 - l_min) // bin_width
+            print(f'l_T_cutoff is set to {l_T_cutoff} and l_T_cutoff_idx is determined to be self.l_T_cutoff_idx. Only these bins from TT, TE, TB will be included in likelihood estimation: {self.spectra.b_arange[:self.l_T_cutoff_idx]}', file=sys.stderr)
 
     @classmethod
-    def load(cls, spectra: Spectra, f_sky: FSky, enforce_zero_theory=True):
+    def load(cls, spectra: Spectra, f_sky: FSky, enforce_zero_theory=True, l_T_cutoff=None):
         '''prepare data from `spectra` for computing Likelihood
 
         :param bool enforce_zero_theory: if True, then enforce TB, EB spectra to be 0 in theory.
@@ -423,25 +444,22 @@ class ComputeLikelihood(object):
             for idx in get_idxs(spectra.spectra, ('TB', 'TE')):
                 temp[idx] = 0.
         theory_spectra = to_spectra_matrix(temp, spectra.spectra)
+        leakage_spectra_BB = spectra.leakage[get_idx(spectra.spectra, 'BB'), 0, 0]
 
         # get realmaps
-        map_cases = [map_case for map_case in spectra.map_cases if 'real' in map_case]
-        assert len(map_cases) == 1
-        map_case = map_cases[0]
-        print(f'Found measured spectra with name {map_case}', file=sys.stderr)
+        map_case = spectra.map_case_real
         Cls = getattr(spectra, map_case)
         # pack signal in real and noise in imag
         Cls_complex = Cls[:, 0, 0, :, 0, 0] + Cls[:, 0, 0, :, 1, 0] * 1.j
         obs_spectra = to_spectra_matrix(Cls_complex, spectra.spectra)
 
         # Primary Sicence product is BB so we choose f_sky accordingly (i.e. it is less than optimal in TB, TE, TT)
-        idx_BB = get_idx(spectra.spectra, 'BB')
-        dof = spectra.rel_dof[idx_BB] * f_sky.get_f_sky('p', 'noise')
+        dof = spectra.rel_dof[get_idx(spectra.spectra, 'BB'), 0, 0] * f_sky.get_f_sky('p', 'noise')
 
         # dust template
         rel_dust_spectra = get_rel_dust_spectra(spectra)
 
-        return cls(spectra, obs_spectra, theory_spectra, rel_dust_spectra, dof, spectra.l_min, spectra.l_max, spectra.bin_width)
+        return cls(spectra, obs_spectra, theory_spectra, leakage_spectra_BB, rel_dust_spectra, dof, spectra.l_min, spectra.l_max, spectra.bin_width, l_T_cutoff=l_T_cutoff)
 
     @property
     def map(self):
@@ -451,11 +469,13 @@ class ComputeLikelihood(object):
             args=(
                 self.obs_spectra,
                 self.theory_spectra,
+                self.leakage_spectra_BB,
                 self.rel_dust_spectra,
                 self.dof,
                 self.l_min,
                 self.l_max,
                 self.bin_width,
+                self.l_T_cutoff_idx,
             ),
             method='Nelder-Mead',
             options={'maxiter': 10000},
@@ -473,11 +493,13 @@ class ComputeLikelihood(object):
                 0.,
                 self.obs_spectra,
                 self.theory_spectra,
+                self.leakage_spectra_BB,
                 self.rel_dust_spectra,
                 self.dof,
                 self.l_min,
                 self.l_max,
                 self.bin_width,
+                self.l_T_cutoff_idx,
             ),
             method='Nelder-Mead',
             options={'maxiter': 10000},
@@ -496,11 +518,13 @@ class ComputeLikelihood(object):
                 1.,
                 self.obs_spectra,
                 self.theory_spectra,
+                self.leakage_spectra_BB,
                 self.rel_dust_spectra,
                 self.dof,
                 self.l_min,
                 self.l_max,
                 self.bin_width,
+                self.l_T_cutoff_idx,
             ),
             method='Nelder-Mead',
             options={'maxiter': 10000},
@@ -519,11 +543,13 @@ class ComputeLikelihood(object):
             self.map,
             self.obs_spectra,
             self.theory_spectra,
+            self.leakage_spectra_BB,
             self.rel_dust_spectra,
             self.dof,
             self.l_min,
             self.l_max,
             self.bin_width,
+            self.l_T_cutoff_idx,
         )
         return dist.cdf(ratio_null)
 
@@ -536,11 +562,13 @@ class ComputeLikelihood(object):
             self.map,
             self.obs_spectra,
             self.theory_spectra,
+            self.leakage_spectra_BB,
             self.rel_dust_spectra,
             self.dof,
             self.l_min,
             self.l_max,
             self.bin_width,
+            self.l_T_cutoff_idx,
         )
         return dist.cdf(ratio_fiducial)
 
@@ -564,15 +592,17 @@ class ComputeLikelihood(object):
             nwalkers,
             ndim,
             log_likelihood,
-            args=[
+            args=(
                 self.obs_spectra,
                 self.theory_spectra,
+                self.leakage_spectra_BB,
                 self.rel_dust_spectra,
                 self.dof,
                 self.l_min,
                 self.l_max,
                 self.bin_width,
-            ],
+                self.l_T_cutoff_idx,
+            ),
         )
 
         pos, prob, state = sampler.run_mcmc(p0, n_run_initial)
@@ -618,7 +648,7 @@ class ComputeLikelihood(object):
             g.map_offdiag(sns.kdeplot, n_levels=4)
             return g
         else:
-            raise ValueError(kind)
+            raise ValueError(f'Invalid kind {kind}: can only be pair/grid.')
 
     def mcmc_ci(self):
         # TODO
